@@ -1,0 +1,109 @@
+# Per-app template: copy to k8s/apps/<app>/app.yaml and replace every APP_NAME,
+# IMAGE and IMAGE_TAG. Nothing else should need to change.
+#
+# Add an app:
+#   1. Create Sentry project APP_NAME (platform: java) and copy its DSN.
+#   2. kubectl create namespace APP_NAME
+#   3. kubectl -n APP_NAME create secret generic sentry --from-literal=dsn='<DSN>'
+#   4. cp -r k8s/apps/_template k8s/apps/APP_NAME && edit the placeholders
+#   5. kubectl apply -f k8s/apps/APP_NAME/app.yaml
+#
+# The app gets, with no code changes: traces (incoming/outgoing HTTP, JDBC, ...),
+# errors, continuous profiling, release tagging, and JVM runtime metrics on :9464
+# (scraped by platform Prometheus, forwarded to Sentry project platform-k8s).
+# Custom logs/metrics: compileOnly("io.sentry:sentry:8.58.0") and call Sentry.logger() /
+# Sentry.metrics(); keep that version equal to the sentry-agent-init tag.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: APP_NAME
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentry-properties
+  namespace: APP_NAME
+data:
+  sentry.properties: |
+    traces-sample-rate=1.0
+    profile-session-sample-rate=1.0
+    profile-lifecycle=TRACE
+    logs.enabled=true
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: APP_NAME
+  namespace: APP_NAME
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: APP_NAME
+  template:
+    metadata:
+      labels:
+        app: APP_NAME
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+    spec:
+      initContainers:
+      - name: sentry-agent-init
+        image: sentry-agent-init:8.58.0
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {memory: 64Mi}
+      containers:
+      - name: app
+        image: IMAGE:IMAGE_TAG
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: jvm-metrics
+          containerPort: 9464
+        env:
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef: {name: sentry, key: dsn}
+        - name: SENTRY_ENVIRONMENT
+          value: "k3d"
+        - name: SENTRY_RELEASE
+          value: "APP_NAME@IMAGE_TAG"
+        - name: SENTRY_PROPERTIES_FILE
+          value: "/etc/sentry/sentry.properties"
+        - name: JAVA_TOOL_OPTIONS
+          value: "-javaagent:/sentry/sentry-opentelemetry-agent.jar -XX:MaxRAMPercentage=75 -Djava.net.preferIPv4Stack=true"
+        - name: OTEL_SERVICE_NAME
+          value: "APP_NAME"
+        - name: OTEL_TRACES_EXPORTER      # traces go to Sentry, not an OTLP endpoint
+          value: "none"
+        - name: OTEL_LOGS_EXPORTER
+          value: "none"
+        - name: OTEL_METRICS_EXPORTER     # JVM runtime metrics -> :9464 for Prometheus
+          value: "prometheus"
+        - name: OTEL_EXPORTER_PROMETHEUS_PORT
+          value: "9464"
+        - name: OTEL_EXPORTER_PROMETHEUS_HOST   # default is localhost: unreachable for Prometheus
+          value: "0.0.0.0"
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+          readOnly: true
+        - name: sentry-properties
+          mountPath: /etc/sentry
+          readOnly: true
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 512Mi}
+      volumes:
+      - name: sentry-agent
+        emptyDir: {}
+      - name: sentry-properties
+        configMap:
+          name: sentry-properties

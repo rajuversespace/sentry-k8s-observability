@@ -1,0 +1,99 @@
+# web3j-rpc-logger: generated from k8s/apps/_template/app.yaml (+ RPC_URL, POLL_INTERVAL).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: web3j-rpc-logger
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentry-properties
+  namespace: web3j-rpc-logger
+data:
+  sentry.properties: |
+    traces-sample-rate=1.0
+    profile-session-sample-rate=1.0
+    profile-lifecycle=TRACE
+    logs.enabled=true
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web3j-rpc-logger
+  namespace: web3j-rpc-logger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web3j-rpc-logger
+  template:
+    metadata:
+      labels:
+        app: web3j-rpc-logger
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+    spec:
+      initContainers:
+      - name: sentry-agent-init
+        image: sentry-agent-init:8.58.0
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {memory: 64Mi}
+      containers:
+      - name: app
+        image: web3j-rpc-logger:v9
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: jvm-metrics
+          containerPort: 9464
+        env:
+        - name: RPC_URL
+          value: "https://ethereum.publicnode.com"
+        - name: POLL_INTERVAL
+          value: "10000"
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef: {name: sentry, key: dsn}
+        - name: SENTRY_ENVIRONMENT
+          value: "k3d"
+        - name: SENTRY_RELEASE
+          value: "web3j-rpc-logger@v9"
+        - name: SENTRY_PROPERTIES_FILE
+          value: "/etc/sentry/sentry.properties"
+        - name: JAVA_TOOL_OPTIONS
+          value: "-javaagent:/sentry/sentry-opentelemetry-agent.jar -XX:MaxRAMPercentage=75 -Djava.net.preferIPv4Stack=true"
+        - name: OTEL_SERVICE_NAME
+          value: "web3j-rpc-logger"
+        - name: OTEL_TRACES_EXPORTER      # traces go to Sentry, not an OTLP endpoint
+          value: "none"
+        - name: OTEL_LOGS_EXPORTER
+          value: "none"
+        - name: OTEL_METRICS_EXPORTER     # JVM runtime metrics -> :9464 for Prometheus
+          value: "prometheus"
+        - name: OTEL_EXPORTER_PROMETHEUS_PORT
+          value: "9464"
+        - name: OTEL_EXPORTER_PROMETHEUS_HOST   # default is localhost: unreachable for Prometheus
+          value: "0.0.0.0"
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+          readOnly: true
+        - name: sentry-properties
+          mountPath: /etc/sentry
+          readOnly: true
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 512Mi}
+      volumes:
+      - name: sentry-agent
+        emptyDir: {}
+      - name: sentry-properties
+        configMap:
+          name: sentry-properties

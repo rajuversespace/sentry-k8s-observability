@@ -1,0 +1,17 @@
+# Build output
+build/
+.gradle/
+*.log
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Secrets: DSNs and tokens go in Kubernetes Secrets / ~/.sentry-alerts-token, never here
+.env
+*.env
+.sentry-alerts-token
+.sentryclirc
+sentry.properties.local

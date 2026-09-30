@@ -1,0 +1,122 @@
+# prom-bridge (namespace platform): runs each PromQL query against Prometheus every
+# 15s and sends every resulting series to Sentry project platform-k8s as a gauge,
+# Prometheus labels kept as attributes. Same image as web3j-rpc-logger, different
+# main class; Sentry comes from the same sentry-agent-init container as every app.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prom-bridge-queries
+  namespace: platform
+data:
+  # <sentry.metric.name>|<unit>|<PromQL>   (wrap counters in rate()/increase())
+  queries.txt: |
+    # Every container in the cluster (cAdvisor via kubelet)
+    k8s.container.cpu.usage|percent|sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{container!="", container!="POD"}[2m])) * 100
+    k8s.container.cpu.throttled|none|sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total{container!="", container!="POD"}[2m]))
+    k8s.container.memory.working_set|byte|sum by (namespace, pod, container) (container_memory_working_set_bytes{container!="", container!="POD"})
+    k8s.container.memory.limit|byte|sum by (namespace, pod, container) (container_spec_memory_limit_bytes{container!="", container!="POD"}) > 0
+    k8s.container.memory.utilization|percent|100 * sum by (namespace, pod, container) (container_memory_working_set_bytes{container!="", container!="POD"}) / (sum by (namespace, pod, container) (container_spec_memory_limit_bytes{container!="", container!="POD"}) > 0)
+    k8s.container.oom_events|none|sum by (namespace, pod, container) (increase(container_oom_events_total{container!=""}[5m]))
+    k8s.pod.network.receive_bytes_per_second|byte|sum by (namespace, pod) (rate(container_network_receive_bytes_total[2m]))
+    k8s.pod.network.transmit_bytes_per_second|byte|sum by (namespace, pod) (rate(container_network_transmit_bytes_total[2m]))
+
+    # Pod state (kube-state-metrics)
+    k8s.container.restarts|none|sum by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total[5m]))
+    k8s.container.waiting|none|sum by (namespace, pod, container, reason) (kube_pod_container_status_waiting_reason) > 0
+
+    # App JVM runtime (Sentry agent's OpenTelemetry metrics on :9464, per app namespace)
+    jvm.memory.used|byte|sum by (namespace, pod, jvm_memory_type) (jvm_memory_used_bytes)
+    jvm.memory.heap.limit|byte|sum by (namespace, pod) (jvm_memory_limit_bytes{jvm_memory_type="heap"})
+    jvm.gc.time_ratio|ratio|sum by (namespace, pod, jvm_gc_name) (rate(jvm_gc_duration_seconds_sum[2m]))
+    jvm.cpu.utilization|percent|sum by (namespace, pod) (jvm_cpu_recent_utilization) * 100
+    jvm.threads|none|sum by (namespace, pod) (jvm_thread_count)
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentry-properties
+  namespace: platform
+data:
+  # Tracing off: the bridge's own Prometheus HTTP calls are not worth traces.
+  sentry.properties: |
+    traces-sample-rate=0
+    logs.enabled=true
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-bridge
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prom-bridge
+  template:
+    metadata:
+      labels:
+        app: prom-bridge
+    spec:
+      initContainers:
+      - name: sentry-agent-init
+        image: sentry-agent-init:8.58.0
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {memory: 64Mi}
+      containers:
+      - name: prom-bridge
+        image: web3j-rpc-logger:v9
+        imagePullPolicy: IfNotPresent
+        command: ["java", "-cp", "/app/lib/*", "rpclogger.PromBridgeKt"]
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus:9090"
+        - name: QUERIES_FILE
+          value: "/etc/prom-bridge/queries.txt"
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef: {name: sentry, key: dsn}
+        - name: SENTRY_ENVIRONMENT
+          value: "k3d"
+        - name: SENTRY_RELEASE
+          value: "prom-bridge@v9"
+        - name: SENTRY_PROPERTIES_FILE
+          value: "/etc/sentry/sentry.properties"
+        - name: JAVA_TOOL_OPTIONS
+          value: "-javaagent:/sentry/sentry-opentelemetry-agent.jar -XX:MaxRAMPercentage=75 -Djava.net.preferIPv4Stack=true"
+        - name: OTEL_SERVICE_NAME
+          value: "prom-bridge"
+        - name: OTEL_TRACES_EXPORTER
+          value: "none"
+        - name: OTEL_LOGS_EXPORTER
+          value: "none"
+        - name: OTEL_METRICS_EXPORTER
+          value: "none"
+        volumeMounts:
+        - name: sentry-agent
+          mountPath: /sentry
+          readOnly: true
+        - name: sentry-properties
+          mountPath: /etc/sentry
+          readOnly: true
+        - name: queries
+          mountPath: /etc/prom-bridge
+          readOnly: true
+        resources:
+          requests: {cpu: 50m, memory: 128Mi}
+          limits: {memory: 384Mi}
+      volumes:
+      - name: sentry-agent
+        emptyDir: {}
+      - name: sentry-properties
+        configMap:
+          name: sentry-properties
+      - name: queries
+        configMap:
+          name: prom-bridge-queries

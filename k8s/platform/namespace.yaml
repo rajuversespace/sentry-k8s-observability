@@ -1,0 +1,6 @@
+# Shared observability platform: Prometheus, kube-state-metrics, prom-bridge.
+# Sentry project for everything here: platform-k8s (Secret "sentry" in this namespace).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform

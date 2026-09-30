@@ -1,0 +1,144 @@
+# Prometheus (namespace platform): scrapes cAdvisor on each kubelet (all pods'
+# CPU/memory/network/OOM), kube-state-metrics (restarts, waiting reasons) and any pod
+# annotated prometheus.io/scrape=true (apps' JVM metrics on :9464). No remote_write: prom-bridge reads
+# from Prometheus and forwards to Sentry.
+#
+# Deliberately NOT granted nodes/proxy: GET on it allows exec into any pod on the
+# node via the kubelet WebSocket handshake, with no audit log. cAdvisor is read
+# straight from the kubelet (:10250/metrics/cadvisor), which only needs nodes/metrics.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: platform
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]      # service discovery
+  verbs: ["list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/metrics"]      # kubelet /metrics/cadvisor
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: platform-prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: platform
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: platform
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        metrics_path: /metrics/cadvisor
+        kubernetes_sd_configs:
+          - role: node          # __address__ = <node InternalIP>:10250 (kubelet)
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+
+      # kube-state-metrics reports other pods' namespace/pod labels: keep them.
+      - job_name: kube-state-metrics
+        honor_labels: true
+        static_configs:
+          - targets: ["kube-state-metrics.platform.svc:8080"]
+
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.15.0
+        imagePullPolicy: IfNotPresent
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--storage.tsdb.retention.time=6h"
+        ports:
+        - containerPort: 9090
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "512Mi"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: storage
+          mountPath: /prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: storage
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: platform
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
